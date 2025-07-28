@@ -14,6 +14,6 @@ Uses spaCy embeddings and cosine similarity to rank sections by persona-task rel
 
 
 ## Team Kartooks:
-- [Shashank](github.com/shank50)
-- [Kartikey Vishwakarma](github.com/kartikey752)
+- [Shashank](https://github.com/shank50)
+- [Kartikey Vishwakarma](https://github.com/kartikey752)
 - [Prasannajeet Ojha](https://github.com/pr8teen)
