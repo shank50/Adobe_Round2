@@ -1,0 +1,384 @@
+import os
+import json
+import re
+import fitz # PyMuPDF
+import spacy
+from datetime import datetime
+from collections import defaultdict
+
+# --- Global NLP Model (Load once) ---
+try:
+    nlp = spacy.load("en_core_web_lg")
+    print("SpaCy model 'en_core_web_lg' loaded successfully.")
+    if nlp.vocab.vectors.name is None:
+        print("[WARNING] The loaded SpaCy model 'en_core_web_lg' still has no word vectors loaded. This is unexpected for LG model. Falling back to keyword matching.")
+        nlp = None # Force fallback if no vectors unexpectedly
+except OSError:
+    print("SpaCy model 'en_core_web_lg' not found. Please ensure it's downloaded during Docker build.")
+    print("Falling back to keyword matching for relevance as no suitable NLP model is available.")
+    nlp = None
+
+# --- Round 1A Logic (Enhanced for Round 1B) ---
+
+def extract_document_sections(pdf_path):
+    """
+    Extracts the title and detailed sections (H1, H2, H3) with their
+    full text content and page numbers from a PDF.
+    This is an enhancement of Round 1A's logic for Round 1B.
+    Focus on more robust heading identification and content accumulation.
+    """
+    title = ""
+    sections = [] 
+    
+    document = fitz.open(pdf_path)
+    
+    text_blocks_on_pages = defaultdict(list)
+    max_font_size = 0.0
+    
+    # First pass: Extract all text blocks with font information
+    # Also collect all lines to analyze vertical spacing later if needed
+    all_raw_lines_in_order = [] 
+
+    for page_num in range(document.page_count):
+        page = document.load_page(page_num)
+        
+        # Use get_text("blocks") for a slightly higher level of abstraction, 
+        # then iterate through lines and spans to get font details.
+        # This helps manage block-level content better.
+        page_raw_blocks = page.get_text("dict")['blocks']
+        
+        for block_idx, block in enumerate(page_raw_blocks):
+            if block['type'] == 0: # Text block
+                for line_idx, line in enumerate(block['lines']):
+                    line_text = "".join([span['text'] for span in line['spans']]).strip()
+                    if not line_text: continue # Skip empty lines
+
+                    # Find font info for the first span in the line (assuming consistent font per line)
+                    first_span = line['spans'][0] if line['spans'] else {}
+                    font_size = round(first_span.get('size', 0.0), 2)
+                    is_bold = "bold" in first_span.get('font', '').lower() or "heavy" in first_span.get('font', '').lower()
+                    
+                    # Store line details for processing
+                    line_info = {
+                        "text": line_text,
+                        "font_size": font_size,
+                        "is_bold": is_bold,
+                        "bbox_y0": line['bbox'][1], # y0 of the line
+                        "page": page_num + 1,
+                        "is_heading_candidate": False, # Will determine this in second pass
+                        "actual_level": None
+                    }
+                    text_blocks_on_pages[page_num + 1].append(line_info)
+                    all_raw_lines_in_order.append(line_info)
+
+                    if font_size > max_font_size:
+                        max_font_size = font_size
+    
+    if not all_raw_lines_in_order:
+        print(f"Warning: No meaningful text lines found in {pdf_path}")
+        return "", []
+
+    # Dynamic font size thresholds - adjusted for common document structures
+    # A smaller delta might capture more levels, too large might miss some.
+    H1_REL_THRESHOLD = 0.90 # H1 is usually very close to max font size
+    H2_REL_THRESHOLD = 0.75 # H2 is distinct from H1
+    H3_REL_THRESHOLD = 0.60 # H3 is distinct from H2
+    
+    # Absolute minimum font size for anything to be considered a heading (e.g., generally larger than body text)
+    # Average body text font size is often around 10-12pt.
+    MIN_BODY_FONT_SIZE_APPROX = 10.0 
+    
+    # Calculate actual thresholds based on max_font_size
+    h1_thresh = max_font_size * H1_REL_THRESHOLD
+    h2_thresh = max_font_size * H2_REL_THRESHOLD
+    h3_thresh = max_font_size * H3_REL_THRESHOLD
+    
+    # Refine thresholds based on minimum assumed body text size to avoid mistaking large body text for H3
+    h3_thresh = max(h3_thresh, MIN_BODY_FONT_SIZE_APPROX * 1.2) # H3 must be noticeably larger than body
+    h2_thresh = max(h2_thresh, h3_thresh * 1.15) # H2 must be larger than H3
+    h1_thresh = max(h1_thresh, h2_thresh * 1.1)  # H1 must be larger than H2
+
+    # Step 1: Identify the main document title (typically first page, largest, potentially bold)
+    title_candidates = []
+    if 1 in text_blocks_on_pages:
+        for line_info in text_blocks_on_pages[1]:
+            # A good title candidate is large, possibly bold, and usually a single line or short phrase.
+            if line_info['font_size'] >= h1_thresh and \
+               len(line_info['text'].split()) < 20 and \
+               (line_info['is_bold'] or line_info['font_size'] == max_font_size):
+                title_candidates.append(line_info)
+        
+        if title_candidates:
+            # Sort by size (desc), then y-pos (asc) to pick the most prominent at the top
+            title_candidates.sort(key=lambda x: (-x['font_size'], x['bbox_y0']))
+            title = title_candidates[0]['text']
+        else: # Fallback if no strong title candidate
+            if all_raw_lines_in_order and all_raw_lines_in_order[0]['page'] == 1:
+                title = all_raw_lines_in_order[0]['text'] # Take the very first line if on page 1
+
+    # Step 2: Identify and label actual headings throughout the document
+    # And simultaneously accumulate content into sections.
+    
+    current_section_content_lines = []
+    current_section_meta = None # Holds {level, text, page} of the current section's heading
+
+    for i, line_info in enumerate(all_raw_lines_in_order):
+        text = line_info['text']
+        font_size = line_info['font_size']
+        is_bold = line_info['is_bold']
+        page = line_info['page']
+
+        # Skip the identified title if it's encountered again in the body text (common on first page)
+        if text == title and page == 1:
+            continue
+
+        is_heading = False
+        determined_level = None
+
+        # Heading detection heuristics with stricter conditions
+        # Criteria: Must be bold OR significantly larger AND reasonably short.
+        # Avoid bullet points and very short fragments as headings unless they are extremely prominent.
+        
+        # Check for numeric-only headings (like 1.1, 1.2.3)
+        is_numeric_heading = bool(re.match(r'^\d+(\.\d+)*\s*$', text.split(' ')[0])) # e.g. "1.1 " or "2.3.4 " followed by space
+
+        if font_size >= h1_thresh and len(text.split()) < 15: # H1s tend to be single short lines
+            determined_level = "H1"
+            is_heading = True
+        elif font_size >= h2_thresh and len(text.split()) < 20: # H2s can be longer
+            determined_level = "H2"
+            is_heading = True
+        elif font_size >= h3_thresh and len(text.split()) < 25: # H3s can be even longer
+             # More flexible for H3, but still prefer bold or not ending with sentence punctuation
+            if is_bold or not text.endswith('.') or is_numeric_heading:
+                determined_level = "H3"
+                is_heading = True
+        
+        # Additional filtering: Prevent single character/number/symbol false positives as headings
+        if is_heading and (len(text.strip()) < 3 or (text.strip() in ['.', '•', '-', '1', '2'])):
+            is_heading = False
+
+        if is_heading:
+            # Finalize the previous section if one was being built
+            if current_section_meta is not None:
+                # Only add if content exists for the section, to prevent empty sections
+                if "".join(current_section_content_lines).strip():
+                    sections.append({
+                        "level": current_section_meta["level"],
+                        "text": current_section_meta["text"], # This is the actual heading text
+                        "page": current_section_meta["page"],
+                        "full_content": "\n".join(current_section_content_lines).strip()
+                    })
+            
+            # Start new section
+            current_section_meta = {
+                "level": determined_level,
+                "text": text,
+                "page": page
+            }
+            current_section_content_lines = [] # Reset content accumulator
+        else:
+            # Add current line's text to the content of the current section
+            current_section_content_lines.append(text)
+    
+    # After the loop, add the very last section if any content was accumulated
+    if current_section_meta is not None:
+        if "".join(current_section_content_lines).strip(): # Only add if content is not empty
+            sections.append({
+                "level": current_section_meta["level"],
+                "text": current_section_meta["text"],
+                "page": current_section_meta["page"],
+                "full_content": "\n".join(current_section_content_lines).strip()
+            })
+            
+    # Final sort of sections: by page number, then by level order (H1 < H2 < H3)
+    # and finally by their vertical position (if needed, but simple page+level is often fine)
+    level_order = {"H1": 1, "H2": 2, "H3": 3}
+    sections.sort(key=lambda x: (x["page"], level_order.get(x["level"], 99)))
+
+    return title, sections
+
+
+# --- Round 1B Logic (Minor adjustment to refined_text sentence length) ---
+
+def analyze_document_collection(collection_path, output_base_path):
+    """
+    Analyzes a document collection based on persona and job-to-be-done.
+    """
+    print(f"\n--- Analyzing Collection: {os.path.basename(collection_path)} ---")
+    
+    collection_input_json_path = os.path.join(collection_path, "challenge1b_input.json")
+    pdf_dir = os.path.join(collection_path, "PDFs")
+
+    if not os.path.exists(collection_input_json_path):
+        print(f"Error: {collection_input_json_path} not found.")
+        return
+    if not os.path.exists(pdf_dir):
+        print(f"Error: PDFs directory not found at {pdf_dir}")
+        return
+
+    with open(collection_input_json_path, 'r', encoding='utf-8') as f:
+        collection_input = json.load(f)
+
+    challenge_id = collection_input["challenge_info"]["challenge_id"]
+    test_case_name = collection_input["challenge_info"]["test_case_name"]
+    input_documents_meta = collection_input["documents"]
+    persona_role = collection_input["persona"]["role"]
+    job_task = collection_input["job_to_be_done"]["task"]
+
+    print(f"Challenge ID: {challenge_id}, Test Case: {test_case_name}")
+    print(f"Persona: {persona_role}, Job: {job_task}")
+
+    # Prepare NLP documents for persona and job
+    job_doc = nlp(job_task) if nlp else None
+    persona_doc = nlp(persona_role) if nlp else None
+    
+    nlp_has_vectors = (nlp is not None and job_doc is not None and job_doc.has_vector and \
+                       persona_doc is not None and persona_doc.has_vector)
+
+    all_sections_for_processing = [] 
+    processed_input_filenames = []
+
+    for doc_meta in input_documents_meta:
+        filename = doc_meta["filename"]
+        pdf_path = os.path.join(pdf_dir, filename)
+        
+        if not os.path.exists(pdf_path):
+            print(f"Warning: PDF not found: {pdf_path}. Skipping.")
+            continue
+        
+        print(f"  Extracting sections from {filename}...")
+        doc_title, sections_data_from_pdf = extract_document_sections(pdf_path)
+        
+        processed_input_filenames.append(filename)
+
+        for section in sections_data_from_pdf:
+            section["document"] = filename
+            
+            relevance_score = 0.0
+            section_text_doc = nlp(section["full_content"]) if nlp else None
+
+            if nlp_has_vectors and section_text_doc and section_text_doc.text.strip():
+                # Only compute similarity if there's actual text and vectors are present
+                try:
+                    job_similarity = section_text_doc.similarity(job_doc) if job_doc.has_vector else 0.0
+                    persona_similarity = section_text_doc.similarity(persona_doc) if persona_doc.has_vector else 0.0
+                    relevance_score = (job_similarity * 0.7) + (persona_similarity * 0.3)
+                except ValueError: # Handle cases where a doc might still have no vectors (e.g. all stopwords)
+                    relevance_score = 0.0
+            else:
+                job_keywords = set(j for j in job_task.lower().split() if len(j) > 2) # Basic filter short words
+                section_keywords = set(s for s in section["full_content"].lower().split() if len(s) > 2)
+                matching_keywords = len(job_keywords.intersection(section_keywords))
+                section_len = len(section_keywords)
+                relevance_score = matching_keywords / section_len if section_len > 0 else 0
+
+            section["relevance_score"] = relevance_score 
+            all_sections_for_processing.append(section)
+
+    all_sections_for_processing.sort(key=lambda x: x["relevance_score"], reverse=True)
+
+    extracted_sections_output = []
+    subsection_analysis_output = []
+    
+    top_n_sections_for_analysis = 10 # Increase to analyze more sections for refined text
+
+    for i, section in enumerate(all_sections_for_processing):
+        extracted_sections_output.append({
+            "document": section["document"],
+            "section_title": section["text"], 
+            "importance_rank": i + 1,
+            "page_number": section["page"]
+        })
+
+        if i < top_n_sections_for_analysis:
+            refined_text = ""
+            full_content = section["full_content"]
+
+            if nlp_has_vectors and full_content and full_content.strip():
+                section_nlp_doc = nlp(full_content)
+                sentences = [sent.text.strip() for sent in section_nlp_doc.sents if sent.text.strip() and len(sent.text.strip()) > 15] # Min sentence length
+                
+                sentence_scores = []
+                for sent_text in sentences:
+                    sent_nlp_doc = nlp(sent_text)
+                    if sent_nlp_doc.has_vector and job_doc and job_doc.has_vector:
+                        sentence_scores.append((sent_nlp_doc.similarity(job_doc), sent_text))
+                    else:
+                        sent_keywords = set(s for s in sent_text.lower().split() if len(s) > 2)
+                        job_keywords = set(j for j in job_task.lower().split() if len(j) > 2)
+                        sent_len = len(sent_keywords)
+                        score = len(sent_keywords.intersection(job_keywords)) / sent_len if sent_len > 0 else 0
+                        sentence_scores.append((score, sent_text))
+
+                sentence_scores.sort(key=lambda x: x[0], reverse=True)
+                
+                refined_text_parts = []
+                min_score_threshold_for_sentence = 0.3 if nlp_has_vectors else 0.1 
+                sentence_count = 0
+                for score, text in sentence_scores:
+                    if score >= min_score_threshold_for_sentence and sentence_count < 3: # Up to 3 sentences now
+                        refined_text_parts.append(text)
+                        sentence_count += 1
+                    elif nlp_has_vectors and score < min_score_threshold_for_sentence:
+                        break 
+                    elif not nlp_has_vectors and score == 0:
+                        break 
+                
+                refined_text = " ".join(refined_text_parts).strip()
+                
+            elif full_content: 
+                 lines = [line.strip() for line in full_content.split('\n') if line.strip() and len(line.strip()) > 20] # Filter short lines
+                 refined_text = "\n".join(lines[:3]).strip()
+            
+            if refined_text:
+                subsection_analysis_output.append({
+                    "document": section["document"],
+                    "refined_text": refined_text,
+                    "page_number": section["page"] 
+                })
+
+    output_data = {
+        "metadata": {
+            "input_documents": processed_input_filenames,
+            "persona": persona_role,
+            "job_to_be_done": job_task,
+            "processing_timestamp": datetime.now().isoformat()
+        },
+        "extracted_sections": extracted_sections_output,
+        "subsection_analysis": subsection_analysis_output
+    }
+
+    collection_output_dir = os.path.join(output_base_path, os.path.basename(collection_path))
+    os.makedirs(collection_output_dir, exist_ok=True)
+    
+    output_json_path = os.path.join(collection_output_dir, "challenge1b_output.json")
+    
+    with open(output_json_path, 'w', encoding='utf-8') as f:
+        json.dump(output_data, f, indent=4, ensure_ascii=False)
+    print(f"  Generated output for {os.path.basename(collection_path)}: {output_json_path}")
+
+
+if __name__ == "__main__":
+    INPUT_ROOT_DIR = "/app/input"
+    OUTPUT_ROOT_DIR = "/app/output"
+
+    if not os.path.exists(INPUT_ROOT_DIR):
+        print(f"Error: Input root directory not found: {INPUT_ROOT_DIR}")
+        exit(1)
+    
+    # Ensure the host's output directory is empty BEFORE the container runs
+    # This part is now handled by the user running `sudo rm -rf output` before `docker run`
+    # The container itself should not try to rmtree its own mount point.
+
+    os.makedirs(OUTPUT_ROOT_DIR, exist_ok=True) # Ensure the root output dir exists in case it was entirely removed
+
+    for collection_name in os.listdir(INPUT_ROOT_DIR):
+        collection_path = os.path.join(INPUT_ROOT_DIR, collection_name)
+        
+        if os.path.isdir(collection_path):
+            analyze_document_collection(collection_path, OUTPUT_ROOT_DIR)
+        else:
+            print(f"Skipping non-directory item in input root: {collection_name}")
+
+    print("\nAll document collections processed.")
